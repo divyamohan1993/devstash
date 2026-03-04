@@ -14,6 +14,18 @@ import { detectShells } from "./tools/shell-history/detect.js";
 import { backupHistories } from "./tools/shell-history/backup.js";
 import { restoreHistories, listBackups } from "./tools/shell-history/restore.js";
 import { zipAndVerify } from "./tools/zipper.js";
+import {
+  getDb,
+  closeDb,
+  insertBackup,
+  updateBackupZip,
+  softDeleteBackup,
+  listBackupsFromDb,
+  logActivity,
+  getRecentActivity,
+  upsertShell,
+  getStats,
+} from "./db.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -71,6 +83,17 @@ function getDirSize(dir: string): number {
 export function startServer(port: number, vaultDir: string) {
   mkdirSync(vaultDir, { recursive: true });
 
+  const db = getDb(vaultDir);
+  logActivity(db, "server_start", null, { port, vaultDir: resolve(vaultDir) });
+
+  const shutdown = () => {
+    logActivity(db, "server_stop", null);
+    closeDb();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
   const htmlPath = join(__dirname, "..", "public", "index.html");
   if (!existsSync(htmlPath)) {
     console.error(`GUI file not found: ${htmlPath}`);
@@ -105,43 +128,125 @@ export function startServer(port: number, vaultDir: string) {
         const body = await parseBody(req);
         const shells = Array.isArray(body.shells) ? (body.shells as string[]) : undefined;
         const results = backupHistories(vaultDir, shells);
+
+        if (results.length > 0) {
+          // Extract backup dir name from the first result's destination path
+          const destParts = results[0].destination.replace(/\\/g, "/").split("/");
+          const vaultIdx = destParts.findIndex((p) => p === "vault");
+          const backupDirName = vaultIdx >= 0 ? destParts[vaultIdx + 1] : destParts[destParts.length - 2];
+
+          const totalCommands = results.reduce((s, r) => s + r.lines, 0);
+          const totalSize = results.reduce((s, r) => s + r.sizeBytes, 0);
+          const shellNames = results.map((r) => r.shell);
+
+          insertBackup(db, {
+            name: backupDirName,
+            type: "directory",
+            shells: shellNames,
+            file_count: results.length,
+            total_commands: totalCommands,
+            original_size: totalSize,
+          });
+
+          for (const r of results) {
+            upsertShell(db, r.shell, r.source, r.lines);
+          }
+
+          logActivity(db, "backup", backupDirName, {
+            shells: shellNames,
+            total_commands: totalCommands,
+            size: totalSize,
+          });
+        }
+
         json(res, { results, vaultDir });
         return;
       }
 
       // --- API: List backups ---
       if (method === "GET" && path === "/api/backups") {
-        const entries: unknown[] = [];
+        const dbBackups = listBackupsFromDb(db);
 
-        if (existsSync(vaultDir)) {
-          for (const name of readdirSync(vaultDir).sort().reverse()) {
-            const full = join(vaultDir, name);
-            const stat = statSync(full);
-            const isZip = name.endsWith(".zip");
-            const isDir = stat.isDirectory();
-            if (!isDir && !isZip) continue;
+        if (dbBackups.length > 0) {
+          // DB-powered listing (fast — no filesystem scanning)
+          const entries = dbBackups.map((b) => ({
+            name: b.compressed_size != null ? b.name + ".zip" : b.name,
+            path: join(vaultDir, b.compressed_size != null ? b.name + ".zip" : b.name),
+            type: b.compressed_size != null ? "zip" : "directory",
+            size: b.compressed_size ?? b.original_size,
+            files: b.file_count,
+            modified: b.updated_at,
+            hasZip: b.compressed_size != null,
+            shells: b.shells,
+            total_commands: b.total_commands,
+            compression_ratio: b.compression_ratio,
+            verified: b.verified,
+          }));
 
-            const entry: Record<string, unknown> = {
-              name,
-              path: full,
-              type: isZip ? "zip" : "directory",
-              modified: stat.mtime.toISOString(),
-            };
+          // Also include filesystem-only entries not yet in DB (pre-DB backups)
+          if (existsSync(vaultDir)) {
+            const dbNames = new Set(dbBackups.map((b) => b.name));
+            for (const name of readdirSync(vaultDir).sort().reverse()) {
+              const full = join(vaultDir, name);
+              const stat = statSync(full);
+              const isZip = name.endsWith(".zip");
+              const isDir = stat.isDirectory();
+              if (!isDir && !isZip) continue;
+              const baseName = name.replace(/\.zip$/, "");
+              if (dbNames.has(baseName) || dbNames.has(name)) continue;
 
-            if (isDir) {
-              entry.size = getDirSize(full);
-              entry.files = readdirSync(full).length;
-              // Check if a corresponding zip exists
-              entry.hasZip = existsSync(`${full}.zip`);
-            } else {
-              entry.size = stat.size;
+              entries.push({
+                name,
+                path: full,
+                type: isZip ? "zip" : "directory",
+                size: isDir ? getDirSize(full) : stat.size,
+                files: isDir ? readdirSync(full).length : 0,
+                modified: stat.mtime.toISOString(),
+                hasZip: isDir ? existsSync(`${full}.zip`) : false,
+                shells: [],
+                total_commands: 0,
+                compression_ratio: null,
+                verified: null,
+              });
             }
-
-            entries.push(entry);
           }
-        }
 
-        json(res, entries);
+          json(res, entries);
+        } else {
+          // Fallback: full filesystem scan (for pre-DB vaults)
+          const entries: unknown[] = [];
+          if (existsSync(vaultDir)) {
+            for (const name of readdirSync(vaultDir).sort().reverse()) {
+              const full = join(vaultDir, name);
+              const stat = statSync(full);
+              const isZip = name.endsWith(".zip");
+              const isDir = stat.isDirectory();
+              if (!isDir && !isZip) continue;
+
+              const entry: Record<string, unknown> = {
+                name,
+                path: full,
+                type: isZip ? "zip" : "directory",
+                modified: stat.mtime.toISOString(),
+                shells: [],
+                total_commands: 0,
+                compression_ratio: null,
+                verified: null,
+              };
+
+              if (isDir) {
+                entry.size = getDirSize(full);
+                entry.files = readdirSync(full).length;
+                entry.hasZip = existsSync(`${full}.zip`);
+              } else {
+                entry.size = stat.size;
+              }
+
+              entries.push(entry);
+            }
+          }
+          json(res, entries);
+        }
         return;
       }
 
@@ -160,6 +265,20 @@ export function startServer(port: number, vaultDir: string) {
         }
 
         const result = await zipAndVerify(backupDir);
+
+        updateBackupZip(db, backupName, {
+          compressed_size: result.compressedSize,
+          compression_ratio: result.compressionRatio,
+          verified: result.verified,
+        });
+
+        logActivity(db, "zip", backupName, {
+          original_size: result.originalSize,
+          compressed_size: result.compressedSize,
+          ratio: result.compressionRatio,
+          verified: result.verified,
+        });
+
         json(res, result);
         return;
       }
@@ -200,6 +319,12 @@ export function startServer(port: number, vaultDir: string) {
 
         const results = restoreHistories(restoreDir, mode);
 
+        logActivity(db, "restore", backupName, {
+          mode,
+          shells_restored: results.length,
+          total_commands: results.reduce((s, r) => s + r.linesRestored, 0),
+        });
+
         if (tmpExtracted) {
           const parent = restoreDir.includes("_restore-tmp-")
             ? restoreDir
@@ -233,6 +358,8 @@ export function startServer(port: number, vaultDir: string) {
         }
 
         rmSync(backupPath, { recursive: true, force: true });
+        softDeleteBackup(db, backupName);
+        logActivity(db, "delete", backupName);
         json(res, { deleted: backupName });
         return;
       }
@@ -370,6 +497,19 @@ export function startServer(port: number, vaultDir: string) {
         const content = readFileSync(targetPath, "utf-8");
         const stat = statSync(targetPath);
         json(res, { path: reqPath, content, size: stat.size });
+        return;
+      }
+
+      // --- API: Activity feed ---
+      if (method === "GET" && path === "/api/activity") {
+        const limit = parseInt(url.searchParams.get("limit") || "15", 10);
+        json(res, getRecentActivity(db, limit));
+        return;
+      }
+
+      // --- API: Aggregate stats ---
+      if (method === "GET" && path === "/api/stats") {
+        json(res, getStats(db));
         return;
       }
 

@@ -168,6 +168,8 @@ async function api(method, path, body) {
 var currentView = 'dashboard';
 var shells = [];
 var backups = [];
+var activity = [];
+var dbStats = {};
 var explorerPath = '';
 var explorerItems = [];
 var fileContent = null;
@@ -264,6 +266,12 @@ async function loadShells() {
 async function loadBackups() {
   backups = await api('GET', '/api/backups');
 }
+async function loadActivity() {
+  activity = await api('GET', '/api/activity?limit=15');
+}
+async function loadStats() {
+  dbStats = await api('GET', '/api/stats');
+}
 async function loadExplorer(path) {
   explorerPath = path || '';
   var data = await api('GET', '/api/explore?path=' + encodeURIComponent(explorerPath));
@@ -282,7 +290,7 @@ async function doBackup() {
     } else {
       toast('No shell histories found to backup', 'info');
     }
-    await loadBackups();
+    await Promise.all([loadBackups(), loadActivity(), loadStats()]);
     render();
   } catch (e) { toast('Backup failed: ' + e.message, 'error'); }
 }
@@ -293,7 +301,7 @@ async function doZip(name) {
     var result = await api('POST', '/api/backups/' + encodeURIComponent(name) + '/zip');
     var ratio = Math.round(result.compressionRatio * 100);
     toast('Zipped: ' + fmtSize(result.compressedSize) + ' (' + ratio + '% smaller) — ' + result.verifyDetails, 'success');
-    await loadBackups();
+    await Promise.all([loadBackups(), loadActivity(), loadStats()]);
     render();
   } catch (e) { toast('Zip failed: ' + e.message, 'error'); }
 }
@@ -315,7 +323,7 @@ async function doDelete(name) {
   try {
     await api('DELETE', '/api/backups/' + encodeURIComponent(name));
     toast('Deleted: ' + name, 'success');
-    await loadBackups();
+    await Promise.all([loadBackups(), loadActivity(), loadStats()]);
     render();
   } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
 }
@@ -338,25 +346,27 @@ async function doReadFile(path) {
 /* === Views === */
 function renderDashboard(main) {
   var found = shells.filter(function(s) { return s.exists; });
-  var dirs = backups.filter(function(b) { return b.type === 'directory'; });
-  var zips = backups.filter(function(b) { return b.type === 'zip'; });
 
-  /* Stats */
-  var stats = h('div', { cls: 'stats-bar' },
+  /* DB-powered stats */
+  var statsBar = h('div', { cls: 'stats-bar' },
     h('div', { cls: 'stat-card' },
       h('div', { cls: 'stat-value', text: String(found.length) }),
       h('div', { cls: 'stat-label', text: 'Shells Detected' })
     ),
     h('div', { cls: 'stat-card' },
-      h('div', { cls: 'stat-value', text: String(dirs.length) }),
-      h('div', { cls: 'stat-label', text: 'Backups' })
+      h('div', { cls: 'stat-value', text: String(dbStats.total_backups || 0) }),
+      h('div', { cls: 'stat-label', text: 'Total Backups' })
     ),
     h('div', { cls: 'stat-card' },
-      h('div', { cls: 'stat-value', text: String(zips.length) }),
-      h('div', { cls: 'stat-label', text: 'Archives' })
+      h('div', { cls: 'stat-value', text: (dbStats.total_commands || 0).toLocaleString() }),
+      h('div', { cls: 'stat-label', text: 'Commands Saved' })
+    ),
+    h('div', { cls: 'stat-card' },
+      h('div', { cls: 'stat-value', text: fmtSize(dbStats.total_original_size || 0) }),
+      h('div', { cls: 'stat-label', text: 'Total Size' })
     )
   );
-  main.appendChild(stats);
+  main.appendChild(statsBar);
 
   /* Quick backup */
   var actions = h('div', { style: { marginBottom: '24px' } },
@@ -388,6 +398,41 @@ function renderDashboard(main) {
     grid.appendChild(card);
   });
   main.appendChild(grid);
+
+  /* Activity Feed */
+  if (activity.length > 0) {
+    main.appendChild(h('div', { cls: 'section-title', text: 'Recent Activity', style: { marginTop: '32px' } }));
+    main.appendChild(h('div', { cls: 'section-sub', text: 'Audit trail of all operations' }));
+
+    var activityCard = h('div', { cls: 'card', style: { padding: '0', overflow: 'hidden' } });
+    var iconMap = { backup: '\u25B2', zip: '\u25A0', restore: '\u25BC', 'delete': '\u2716', server_start: '\u25B6', server_stop: '\u25A0' };
+    var labelMap = { backup: 'Backup', zip: 'Zip & Verify', restore: 'Restore', 'delete': 'Delete', server_start: 'Server Start', server_stop: 'Server Stop' };
+
+    activity.forEach(function(a, idx) {
+      var icon = iconMap[a.action] || '\u2022';
+      var label = labelMap[a.action] || a.action;
+      var row = h('div', {
+        style: {
+          padding: '12px 16px',
+          borderBottom: idx < activity.length - 1 ? '1px solid rgba(255,255,255,0.03)' : 'none',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '12px',
+          fontSize: '14px'
+        }
+      },
+        h('span', { text: icon, style: { fontSize: '12px', color: 'var(--primary)', flexShrink: '0', width: '20px', textAlign: 'center' } }),
+        h('div', { style: { flex: '1', minWidth: '0' } },
+          h('span', { text: label, style: { fontWeight: '600' } }),
+          a.target ? h('span', { text: ' \u2014 ' + a.target, style: { color: 'var(--muted)' } }) : null
+        ),
+        h('span', { text: fmtDate(a.created_at), style: { color: 'var(--dim)', fontSize: '12px', flexShrink: '0' } })
+      );
+      activityCard.appendChild(row);
+    });
+
+    main.appendChild(activityCard);
+  }
 }
 
 function renderBackups(main) {
@@ -420,13 +465,31 @@ function renderBackups(main) {
       h('span', { cls: 'badge ' + (isZip ? 'badge-success' : 'badge-info'), text: isZip ? 'Archived' : 'Raw' })
     );
 
+    /* Per-shell badges */
+    var shellTags = null;
+    if (b.shells && b.shells.length) {
+      shellTags = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '8px' } });
+      b.shells.forEach(function(s) {
+        shellTags.appendChild(h('span', { cls: 'badge badge-info', text: s }));
+      });
+    }
+
     var meta = h('div', { cls: 'backup-meta' },
       h('span', { text: fmtSize(b.size) })
     );
-    if (!isZip && b.files !== undefined) {
+    if (b.total_commands) {
+      meta.appendChild(h('span', { text: b.total_commands.toLocaleString() + ' commands' }));
+    }
+    if (!isZip && b.files !== undefined && !b.total_commands) {
       meta.appendChild(h('span', { text: b.files + ' file(s)' }));
     }
-    if (!isZip && b.hasZip) {
+    if (b.compression_ratio != null) {
+      meta.appendChild(h('span', { text: Math.round(b.compression_ratio * 100) + '% compressed' }));
+    }
+    if (b.verified === true) {
+      meta.appendChild(h('span', { cls: 'badge badge-success', text: 'Verified', style: { fontSize: '10px' } }));
+    }
+    if (!isZip && b.hasZip && !b.compression_ratio) {
       meta.appendChild(h('span', { cls: 'badge badge-success', text: 'Zipped', style: { fontSize: '10px' } }));
     }
 
@@ -462,7 +525,10 @@ function renderBackups(main) {
       onClick: function() { doDelete(b.name); }
     }));
 
-    var card = h('div', { cls: 'card backup-card' }, header, meta, btns);
+    var card = h('div', { cls: 'card backup-card' }, header);
+    if (shellTags) card.appendChild(shellTags);
+    card.appendChild(meta);
+    card.appendChild(btns);
     grid.appendChild(card);
   });
   main.appendChild(grid);
@@ -588,7 +654,7 @@ function render() {
 async function init() {
   setupNav();
   try {
-    await Promise.all([loadShells(), loadBackups()]);
+    await Promise.all([loadShells(), loadBackups(), loadActivity(), loadStats()]);
     render();
   } catch (e) {
     toast('Failed to connect to server: ' + e.message, 'error');
