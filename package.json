@@ -31,12 +31,17 @@
     "node": ">=20"
   },
   "files": [
-    "dist"
+    "dist",
+    "public"
   ],
   "dependencies": {
+    "adm-zip": "^0.5.16",
+    "archiver": "^7.0.1",
     "commander": "^14.0.3"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/archiver": "^7.0.0",
     "@types/node": "^25.3.3",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",

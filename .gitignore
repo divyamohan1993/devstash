@@ -21,3 +21,4 @@ coverage/
 *.tgz
 
 backups/
+vault/
