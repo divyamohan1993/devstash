@@ -7,12 +7,15 @@ import {
   rmSync,
   mkdirSync,
 } from "node:fs";
-import { join, resolve, dirname, extname } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import AdmZip from "adm-zip";
 import { detectShells } from "./tools/shell-history/detect.js";
 import { backupHistories } from "./tools/shell-history/backup.js";
-import { restoreHistories, listBackups } from "./tools/shell-history/restore.js";
+import { restoreHistories } from "./tools/shell-history/restore.js";
+import { detectClaudeMemory } from "./tools/claude-memory/detect.js";
+import { backupClaudeMemory } from "./tools/claude-memory/backup.js";
+import { restoreClaudeMemory, listClaudeBackups } from "./tools/claude-memory/restore.js";
 import { zipAndVerify } from "./tools/zipper.js";
 import {
   getDb,
@@ -20,10 +23,8 @@ import {
   insertBackup,
   updateBackupZip,
   softDeleteBackup,
+  getBackup,
   listBackupsFromDb,
-  logActivity,
-  getRecentActivity,
-  upsertShell,
   getStats,
 } from "./db.js";
 
@@ -60,34 +61,13 @@ function isWithinVault(target: string, vaultDir: string): boolean {
   return resolved.startsWith(resolve(vaultDir));
 }
 
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function getDirSize(dir: string): number {
-  let size = 0;
-  try {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const full = join(dir, entry.name);
-      if (entry.isFile()) size += statSync(full).size;
-      else if (entry.isDirectory()) size += getDirSize(full);
-    }
-  } catch {
-    // Ignore permission errors
-  }
-  return size;
-}
 
 export function startServer(port: number, vaultDir: string) {
   mkdirSync(vaultDir, { recursive: true });
 
   const db = getDb(vaultDir);
-  logActivity(db, "server_start", null, { port, vaultDir: resolve(vaultDir) });
 
   const shutdown = () => {
-    logActivity(db, "server_stop", null);
     closeDb();
     process.exit(0);
   };
@@ -99,7 +79,6 @@ export function startServer(port: number, vaultDir: string) {
     console.error(`GUI file not found: ${htmlPath}`);
     process.exit(1);
   }
-  const html = readFileSync(htmlPath, "utf-8");
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url!, `http://localhost:${port}`);
@@ -110,10 +89,10 @@ export function startServer(port: number, vaultDir: string) {
     res.setHeader("X-Frame-Options", "DENY");
 
     try {
-      // --- GUI ---
+      // --- GUI (live reload — reads from disk on every request) ---
       if (method === "GET" && path === "/") {
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(html);
+        res.end(readFileSync(htmlPath, "utf-8"));
         return;
       }
 
@@ -147,106 +126,29 @@ export function startServer(port: number, vaultDir: string) {
             total_commands: totalCommands,
             original_size: totalSize,
           });
-
-          for (const r of results) {
-            upsertShell(db, r.shell, r.source, r.lines);
-          }
-
-          logActivity(db, "backup", backupDirName, {
-            shells: shellNames,
-            total_commands: totalCommands,
-            size: totalSize,
-          });
         }
 
         json(res, { results, vaultDir });
         return;
       }
 
-      // --- API: List backups ---
+      // --- API: List backups (O(n) on backup count — unavoidable for listing) ---
       if (method === "GET" && path === "/api/backups") {
         const dbBackups = listBackupsFromDb(db);
-
-        if (dbBackups.length > 0) {
-          // DB-powered listing (fast — no filesystem scanning)
-          const entries = dbBackups.map((b) => ({
-            name: b.compressed_size != null ? b.name + ".zip" : b.name,
-            path: join(vaultDir, b.compressed_size != null ? b.name + ".zip" : b.name),
-            type: b.compressed_size != null ? "zip" : "directory",
-            size: b.compressed_size ?? b.original_size,
-            files: b.file_count,
-            modified: b.updated_at,
-            hasZip: b.compressed_size != null,
-            shells: b.shells,
-            total_commands: b.total_commands,
-            compression_ratio: b.compression_ratio,
-            verified: b.verified,
-          }));
-
-          // Also include filesystem-only entries not yet in DB (pre-DB backups)
-          if (existsSync(vaultDir)) {
-            const dbNames = new Set(dbBackups.map((b) => b.name));
-            for (const name of readdirSync(vaultDir).sort().reverse()) {
-              const full = join(vaultDir, name);
-              const stat = statSync(full);
-              const isZip = name.endsWith(".zip");
-              const isDir = stat.isDirectory();
-              if (!isDir && !isZip) continue;
-              const baseName = name.replace(/\.zip$/, "");
-              if (dbNames.has(baseName) || dbNames.has(name)) continue;
-
-              entries.push({
-                name,
-                path: full,
-                type: isZip ? "zip" : "directory",
-                size: isDir ? getDirSize(full) : stat.size,
-                files: isDir ? readdirSync(full).length : 0,
-                modified: stat.mtime.toISOString(),
-                hasZip: isDir ? existsSync(`${full}.zip`) : false,
-                shells: [],
-                total_commands: 0,
-                compression_ratio: null,
-                verified: null,
-              });
-            }
-          }
-
-          json(res, entries);
-        } else {
-          // Fallback: full filesystem scan (for pre-DB vaults)
-          const entries: unknown[] = [];
-          if (existsSync(vaultDir)) {
-            for (const name of readdirSync(vaultDir).sort().reverse()) {
-              const full = join(vaultDir, name);
-              const stat = statSync(full);
-              const isZip = name.endsWith(".zip");
-              const isDir = stat.isDirectory();
-              if (!isDir && !isZip) continue;
-
-              const entry: Record<string, unknown> = {
-                name,
-                path: full,
-                type: isZip ? "zip" : "directory",
-                modified: stat.mtime.toISOString(),
-                shells: [],
-                total_commands: 0,
-                compression_ratio: null,
-                verified: null,
-              };
-
-              if (isDir) {
-                entry.size = getDirSize(full);
-                entry.files = readdirSync(full).length;
-                entry.hasZip = existsSync(`${full}.zip`);
-              } else {
-                entry.size = stat.size;
-              }
-
-              entries.push(entry);
-            }
-          }
-          json(res, entries);
-        }
+        const entries = dbBackups.map((b) => ({
+          name: b.compressed_size != null ? b.name + ".zip" : b.name,
+          path: join(vaultDir, b.compressed_size != null ? b.name + ".zip" : b.name),
+          type: b.compressed_size != null ? "zip" : "directory",
+          size: b.compressed_size ?? b.original_size,
+          files: b.file_count,
+          modified: b.updated_at,
+          hasZip: b.compressed_size != null,
+          shells: b.shells,
+          total_commands: b.total_commands,
+          compression_ratio: b.compression_ratio,
+          verified: b.verified,
+        }));
+        json(res, entries);
         return;
       }
 
@@ -271,14 +173,6 @@ export function startServer(port: number, vaultDir: string) {
           compression_ratio: result.compressionRatio,
           verified: result.verified,
         });
-
-        logActivity(db, "zip", backupName, {
-          original_size: result.originalSize,
-          compressed_size: result.compressedSize,
-          ratio: result.compressionRatio,
-          verified: result.verified,
-        });
-
         json(res, result);
         return;
       }
@@ -319,12 +213,6 @@ export function startServer(port: number, vaultDir: string) {
 
         const results = restoreHistories(restoreDir, mode);
 
-        logActivity(db, "restore", backupName, {
-          mode,
-          shells_restored: results.length,
-          total_commands: results.reduce((s, r) => s + r.linesRestored, 0),
-        });
-
         if (tmpExtracted) {
           const parent = restoreDir.includes("_restore-tmp-")
             ? restoreDir
@@ -359,7 +247,6 @@ export function startServer(port: number, vaultDir: string) {
 
         rmSync(backupPath, { recursive: true, force: true });
         softDeleteBackup(db, backupName);
-        logActivity(db, "delete", backupName);
         json(res, { deleted: backupName });
         return;
       }
@@ -435,13 +322,22 @@ export function startServer(port: number, vaultDir: string) {
         // Regular directory
         const stat = statSync(targetPath);
         if (stat.isDirectory()) {
-          const items = readdirSync(targetPath, { withFileTypes: true }).map((entry) => {
+          const hidden = /^devstash\.db|^\.devstash/;
+          const items = readdirSync(targetPath, { withFileTypes: true })
+            .filter((entry) => !hidden.test(entry.name))
+            .map((entry) => {
             const full = join(targetPath, entry.name);
             const s = statSync(full);
+            // For directories: use DB original_size if available (O(1)), else stat size
+            let size = s.size;
+            if (entry.isDirectory()) {
+              const dbRecord = getBackup(db, entry.name);
+              size = dbRecord ? dbRecord.original_size : s.size;
+            }
             return {
               name: entry.name,
               type: entry.isDirectory() ? "directory" : "file",
-              size: entry.isDirectory() ? getDirSize(full) : s.size,
+              size,
               modified: s.mtime.toISOString(),
             };
           });
@@ -500,16 +396,90 @@ export function startServer(port: number, vaultDir: string) {
         return;
       }
 
-      // --- API: Activity feed ---
-      if (method === "GET" && path === "/api/activity") {
-        const limit = parseInt(url.searchParams.get("limit") || "15", 10);
-        json(res, getRecentActivity(db, limit));
+      // --- API: Stats ---
+      if (method === "GET" && path === "/api/stats") {
+        json(res, getStats(db));
         return;
       }
 
-      // --- API: Aggregate stats ---
-      if (method === "GET" && path === "/api/stats") {
-        json(res, getStats(db));
+      // --- API: Detect Claude config ---
+      if (method === "GET" && path === "/api/claude/detect") {
+        json(res, detectClaudeMemory());
+        return;
+      }
+
+      // --- API: Backup Claude memory ---
+      if (method === "POST" && path === "/api/claude/backup") {
+        const result = backupClaudeMemory(vaultDir);
+
+        if (result.filesCopied > 0) {
+          const backupDirName = result.backupDir.replace(/\\/g, "/").split("/").pop()!;
+          insertBackup(db, {
+            name: backupDirName,
+            type: "directory",
+            shells: [],
+            file_count: result.filesCopied,
+            total_commands: 0,
+            original_size: result.totalSizeBytes,
+          });
+        }
+
+        json(res, result);
+        return;
+      }
+
+      // --- API: List Claude memory backups ---
+      if (method === "GET" && path === "/api/claude/backups") {
+        json(res, listClaudeBackups(vaultDir));
+        return;
+      }
+
+      // --- API: Restore Claude memory from backup ---
+      if (method === "POST" && /^\/api\/claude\/backups\/([^/]+)\/restore$/.test(path)) {
+        const backupName = decodeURIComponent(path.split("/")[4]);
+        const backupDir = join(vaultDir, backupName);
+
+        if (!isWithinVault(backupDir, vaultDir)) {
+          err(res, "Access denied", 403);
+          return;
+        }
+        if (!existsSync(backupDir)) {
+          err(res, "Backup not found", 404);
+          return;
+        }
+
+        const body = await parseBody(req);
+        const mode = body.mode === "overwrite" ? "overwrite" : "merge";
+
+        let restoreDir = backupDir;
+        let tmpExtracted = false;
+
+        if (backupName.endsWith(".zip")) {
+          const admZip = new AdmZip(backupDir);
+          restoreDir = join(vaultDir, `_restore-claude-tmp-${Date.now()}`);
+          admZip.extractAllTo(restoreDir, true);
+          tmpExtracted = true;
+
+          const inner = readdirSync(restoreDir);
+          if (inner.length === 1 && statSync(join(restoreDir, inner[0])).isDirectory()) {
+            restoreDir = join(restoreDir, inner[0]);
+          }
+        }
+
+        const results = restoreClaudeMemory(restoreDir, mode as "merge" | "overwrite");
+
+        if (tmpExtracted) {
+          try {
+            rmSync(
+              restoreDir.includes("_restore-claude-tmp-") ? restoreDir : dirname(restoreDir),
+              { recursive: true, force: true }
+            );
+          } catch {
+            // Best-effort cleanup
+          }
+        }
+
+        json(res, results);
         return;
       }
 

@@ -23,6 +23,9 @@ REM === Also kill any orphan devstash processes ===
 for /f "tokens=2" %%a in ('tasklist /fi "WINDOWTITLE eq devstash-server" /fo list 2^>nul ^| findstr "PID"') do (
     taskkill /PID %%a /T /F >nul 2>&1
 )
+for /f "tokens=2" %%a in ('tasklist /fi "WINDOWTITLE eq devstash-watcher" /fo list 2^>nul ^| findstr "PID"') do (
+    taskkill /PID %%a /T /F >nul 2>&1
+)
 
 REM === Check Node.js ===
 where node >nul 2>&1
@@ -100,11 +103,14 @@ REM === Clean up temp artifacts before starting ===
 if exist "vault\*.tmp" del /q "vault\*.tmp" >nul 2>&1
 for /d %%d in ("vault\_restore-tmp-*") do rd /s /q "%%d" >nul 2>&1
 
-REM === Start server ===
+REM === Start tsup watcher (auto-rebuilds on src/ changes) ===
+start "devstash-watcher" /min pnpm dev
+
+REM === Start server with auto-restart on dist/ changes ===
 echo.
-echo   Starting devstash GUI...
+echo   Starting devstash GUI (live reload enabled)...
 echo.
-start "devstash-server" /b node dist/cli.js gui --port %PORT%
+start "devstash-server" /b node --watch-path=dist dist/cli.js gui --port %PORT%
 
 REM === Wait for server to be ready ===
 set RETRIES=0
@@ -130,9 +136,12 @@ echo %PORT%>".devstash.port"
 
 REM === Open browser ===
 echo   =============================================
-echo     devstash is running!
+echo     devstash is running!  (live reload on)
 echo     http://localhost:%PORT%
 echo   =============================================
+echo.
+echo   GUI changes:    edit public/index.html, refresh browser
+echo   Server changes: edit src/*.ts, auto-rebuilds + auto-restarts
 echo.
 echo   Close this window or run stop.bat to shut down.
 echo.

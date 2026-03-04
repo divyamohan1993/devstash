@@ -25,6 +25,12 @@ for /f "tokens=2" %%a in ('tasklist /fi "WINDOWTITLE eq devstash-server" /fo lis
     set FOUND=1
 )
 
+REM === Kill tsup watcher ===
+for /f "tokens=2" %%a in ('tasklist /fi "WINDOWTITLE eq devstash-watcher" /fo list 2^>nul ^| findstr "PID"') do (
+    echo   Stopping file watcher [PID %%a]...
+    taskkill /PID %%a /T /F >nul 2>&1
+)
+
 REM === Show port that was used ===
 if exist ".devstash.port" (
     set /p PORT=<.devstash.port

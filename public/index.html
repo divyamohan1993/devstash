@@ -168,7 +168,6 @@ async function api(method, path, body) {
 var currentView = 'dashboard';
 var shells = [];
 var backups = [];
-var activity = [];
 var dbStats = {};
 var explorerPath = '';
 var explorerItems = [];
@@ -256,7 +255,11 @@ function navigate(view) {
   currentView = view;
   fileContent = null;
   updateNavActive();
-  render();
+  if (view === 'explorer' && explorerItems.length === 0 && !explorerPath) {
+    doExplore('');
+  } else {
+    render();
+  }
 }
 
 /* === Data Loading === */
@@ -265,9 +268,6 @@ async function loadShells() {
 }
 async function loadBackups() {
   backups = await api('GET', '/api/backups');
-}
-async function loadActivity() {
-  activity = await api('GET', '/api/activity?limit=15');
 }
 async function loadStats() {
   dbStats = await api('GET', '/api/stats');
@@ -290,7 +290,7 @@ async function doBackup() {
     } else {
       toast('No shell histories found to backup', 'info');
     }
-    await Promise.all([loadBackups(), loadActivity(), loadStats()]);
+    await Promise.all([loadBackups(), loadStats()]);
     render();
   } catch (e) { toast('Backup failed: ' + e.message, 'error'); }
 }
@@ -301,7 +301,7 @@ async function doZip(name) {
     var result = await api('POST', '/api/backups/' + encodeURIComponent(name) + '/zip');
     var ratio = Math.round(result.compressionRatio * 100);
     toast('Zipped: ' + fmtSize(result.compressedSize) + ' (' + ratio + '% smaller) — ' + result.verifyDetails, 'success');
-    await Promise.all([loadBackups(), loadActivity(), loadStats()]);
+    await Promise.all([loadBackups(), loadStats()]);
     render();
   } catch (e) { toast('Zip failed: ' + e.message, 'error'); }
 }
@@ -323,7 +323,7 @@ async function doDelete(name) {
   try {
     await api('DELETE', '/api/backups/' + encodeURIComponent(name));
     toast('Deleted: ' + name, 'success');
-    await Promise.all([loadBackups(), loadActivity(), loadStats()]);
+    await Promise.all([loadBackups(), loadStats()]);
     render();
   } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
 }
@@ -399,40 +399,6 @@ function renderDashboard(main) {
   });
   main.appendChild(grid);
 
-  /* Activity Feed */
-  if (activity.length > 0) {
-    main.appendChild(h('div', { cls: 'section-title', text: 'Recent Activity', style: { marginTop: '32px' } }));
-    main.appendChild(h('div', { cls: 'section-sub', text: 'Audit trail of all operations' }));
-
-    var activityCard = h('div', { cls: 'card', style: { padding: '0', overflow: 'hidden' } });
-    var iconMap = { backup: '\u25B2', zip: '\u25A0', restore: '\u25BC', 'delete': '\u2716', server_start: '\u25B6', server_stop: '\u25A0' };
-    var labelMap = { backup: 'Backup', zip: 'Zip & Verify', restore: 'Restore', 'delete': 'Delete', server_start: 'Server Start', server_stop: 'Server Stop' };
-
-    activity.forEach(function(a, idx) {
-      var icon = iconMap[a.action] || '\u2022';
-      var label = labelMap[a.action] || a.action;
-      var row = h('div', {
-        style: {
-          padding: '12px 16px',
-          borderBottom: idx < activity.length - 1 ? '1px solid rgba(255,255,255,0.03)' : 'none',
-          display: 'flex',
-          alignItems: 'center',
-          gap: '12px',
-          fontSize: '14px'
-        }
-      },
-        h('span', { text: icon, style: { fontSize: '12px', color: 'var(--primary)', flexShrink: '0', width: '20px', textAlign: 'center' } }),
-        h('div', { style: { flex: '1', minWidth: '0' } },
-          h('span', { text: label, style: { fontWeight: '600' } }),
-          a.target ? h('span', { text: ' \u2014 ' + a.target, style: { color: 'var(--muted)' } }) : null
-        ),
-        h('span', { text: fmtDate(a.created_at), style: { color: 'var(--dim)', fontSize: '12px', flexShrink: '0' } })
-      );
-      activityCard.appendChild(row);
-    });
-
-    main.appendChild(activityCard);
-  }
 }
 
 function renderBackups(main) {
@@ -654,7 +620,7 @@ function render() {
 async function init() {
   setupNav();
   try {
-    await Promise.all([loadShells(), loadBackups(), loadActivity(), loadStats()]);
+    await Promise.all([loadShells(), loadBackups(), loadStats()]);
     render();
   } catch (e) {
     toast('Failed to connect to server: ' + e.message, 'error');

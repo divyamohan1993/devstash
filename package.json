@@ -8,7 +8,8 @@
   },
   "scripts": {
     "build": "tsup src/cli.ts --format esm --dts --clean --external better-sqlite3",
-    "dev": "tsup src/cli.ts --format esm --watch",
+    "dev": "tsup src/cli.ts --format esm --watch --external better-sqlite3",
+    "dev:gui": "node --watch-path=dist dist/cli.js gui",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
