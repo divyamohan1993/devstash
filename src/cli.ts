@@ -18,7 +18,7 @@ program
 program
   .command("gui")
   .description("Launch the web-based GUI")
-  .option("-p, --port <port>", "Port number", "9877")
+  .option("-p, --port <port>", "Port number (IANA private range)", "51877")
   .option("-v, --vault <dir>", "Vault directory for backups", DEFAULT_VAULT_DIR)
   .action((opts) => {
     startServer(parseInt(opts.port, 10), resolve(opts.vault));

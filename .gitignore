@@ -22,3 +22,6 @@ coverage/
 
 backups/
 vault/
+
+.devstash.pid
+.devstash.port
